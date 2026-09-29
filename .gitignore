@@ -1,0 +1,9 @@
+node_modules/
+output/
+__pycache__/
+.cursor/
+*.pyc
+.DS_Store
+Thumbs.db
+.env
+.env.*
