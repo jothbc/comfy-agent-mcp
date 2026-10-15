@@ -41,7 +41,13 @@ function runCli(args) {
 
     child.on("close", (code) => {
       if (code !== 0) {
-        reject(new Error(stderr || `CLI exited with code ${code}`));
+        let message = stderr || `CLI exited with code ${code}`;
+        try {
+          message = JSON.parse(stdout).error ?? message;
+        } catch {
+          // stdout is not JSON; keep stderr
+        }
+        reject(new Error(message));
         return;
       }
 
@@ -60,13 +66,47 @@ const aspectRatios = {
   "9:16": "9:16 (Portrait)",
 };
 
+// Stays under the 60s default MCP client request timeout.
+const MAX_WAIT_SECONDS = 50;
+
+const QUEUED_NOTE =
+  "Jobs are queued, not finished. Call get_result with these prompt_ids " +
+  "to receive the image paths.";
+
+async function queueJobs(args) {
+  const result = await runCli([...args, "--no-wait"]);
+
+  if (!result.success) {
+    throw new Error(JSON.stringify(result));
+  }
+
+  return {
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify(
+          {
+            ...result,
+            prompt_ids: result.results.map((item) => item.prompt_id),
+            note: QUEUED_NOTE,
+          },
+          null,
+          2,
+        ),
+      },
+    ],
+  };
+}
+
 server.registerTool(
   "generate_image",
   {
     title: "Generate Image",
     description:
       "Generate one or more images locally using ComfyUI and Qwen Image 2.1. " +
-      "Returns generation details and image paths. The seed is a decimal string; " +
+      "Queues the job(s) and returns immediately with prompt_ids and seeds; " +
+      "then call get_result with the prompt_ids to wait for and receive the image paths. " +
+      "The seed is a decimal string; " +
       "pass that exact string back to reproduce the same generation. " +
       "A seed does not edit an existing picture; use edit_image for that. " +
       "Prefer width+height for exact sizes (icons ~256-512, UI ~1024, cinematic up to 2048). " +
@@ -126,20 +166,7 @@ server.registerTool(
       args.push("--seed", seed);
     }
 
-    const result = await runCli(args);
-
-    if (!result.success) {
-      throw new Error(JSON.stringify(result));
-    }
-
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(result, null, 2),
-        },
-      ],
-    };
+    return queueJobs(args);
   }
 );
 
@@ -152,6 +179,8 @@ server.registerTool(
       "Pass the file path and an instruction such as 'remove the Chinese text and keep the rest unchanged'. " +
       "The source image is used as a reference, so the result stays close to the original. " +
       "Reusing a generation seed does not edit a picture; use this tool instead. " +
+      "Queues the job(s) and returns immediately with prompt_ids and seeds; " +
+      "then call get_result with the prompt_ids to wait for and receive the image paths. " +
       "The returned seed is a decimal string; pass it back exactly to reproduce the same edit.",
     inputSchema: {
       image_path: z.string().min(1)
@@ -183,10 +212,36 @@ server.registerTool(
       args.push("--negative", negative_prompt);
     }
 
-    const result = await runCli(args);
+    return queueJobs(args);
+  }
+);
 
-    if (!result.success) {
-      throw new Error(JSON.stringify(result));
+server.registerTool(
+  "get_result",
+  {
+    title: "Get Image Result",
+    description:
+      "Wait for images queued by generate_image or edit_image and return their file paths. " +
+      `Waits up to wait_seconds (max ${MAX_WAIT_SECONDS}). ` +
+      "Each result has a status: completed (images ready), running, queued, error, or not_found. " +
+      "If done is false, some jobs are still generating: call get_result again with the same prompt_ids " +
+      "and keep calling until done is true. Slow machines can need several calls.",
+    inputSchema: {
+      prompt_ids: z.array(z.string().min(1)).min(1).max(16)
+        .describe("prompt_ids returned by generate_image or edit_image"),
+      wait_seconds: z.number().min(0).max(MAX_WAIT_SECONDS).default(45)
+        .describe(`Max seconds to wait before reporting pending jobs (0-${MAX_WAIT_SECONDS})`),
+    },
+  },
+  async ({ prompt_ids, wait_seconds }) => {
+    const result = await runCli([
+      "--result", ...prompt_ids,
+      "--wait-seconds", String(wait_seconds),
+    ]);
+
+    if (!result.done) {
+      result.note =
+        "Some jobs are still generating. Call get_result again with the same prompt_ids.";
     }
 
     return {
@@ -196,6 +251,7 @@ server.registerTool(
           text: JSON.stringify(result, null, 2),
         },
       ],
+      isError: !result.success,
     };
   }
 );

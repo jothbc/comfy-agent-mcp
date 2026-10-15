@@ -170,22 +170,42 @@ def queue_prompt(workflow):
     return data["prompt_id"]
 
 
+def fetch_history(prompt_id):
+    response = requests.get(
+        f"{COMFY_URL}/history/{prompt_id}",
+        timeout=30,
+    )
+
+    response.raise_for_status()
+
+    return response.json().get(prompt_id)
+
+
+def queue_state(prompt_id):
+    response = requests.get(f"{COMFY_URL}/queue", timeout=30)
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    if any(item[1] == prompt_id for item in data.get("queue_running", [])):
+        return "running"
+
+    if any(item[1] == prompt_id for item in data.get("queue_pending", [])):
+        return "queued"
+
+    return "not_found"
+
+
 def wait_for_completion(prompt_id, quiet=False):
     if not quiet:
         print(f"Prompt enviado: {prompt_id}")
 
     while True:
-        response = requests.get(
-            f"{COMFY_URL}/history/{prompt_id}",
-            timeout=30,
-        )
+        history = fetch_history(prompt_id)
 
-        response.raise_for_status()
-
-        history = response.json()
-
-        if prompt_id in history:
-            return history[prompt_id]
+        if history is not None:
+            return history
 
         if not quiet:
             print(".", end="", flush=True)
@@ -232,6 +252,79 @@ def download_image(image_info, output_dir):
     return destination.resolve().as_posix()
 
 
+def history_images(history, output_dir):
+    status = history.get("status", {})
+    if status.get("status_str") == "error":
+        raise RuntimeError(
+            json.dumps(status.get("messages", status), ensure_ascii=False)
+        )
+
+    return [
+        download_image(image, output_dir)
+        for image in extract_images(history)
+    ]
+
+
+def finished_result(prompt_id, history, output_dir):
+    try:
+        return {
+            "prompt_id": prompt_id,
+            "status": "completed",
+            "images": history_images(history, output_dir),
+        }
+    except Exception as e:
+        return {
+            "prompt_id": prompt_id,
+            "status": "error",
+            "error": str(e),
+        }
+
+
+def collect_results(prompt_ids, wait_seconds, output_dir):
+    """Wait up to wait_seconds for queued prompts, then report each status."""
+    deadline = time.monotonic() + wait_seconds
+    results = {}
+    pending = list(dict.fromkeys(prompt_ids))
+
+    while True:
+        for prompt_id in list(pending):
+            history = fetch_history(prompt_id)
+            if history is not None:
+                results[prompt_id] = finished_result(
+                    prompt_id,
+                    history,
+                    output_dir,
+                )
+                pending.remove(prompt_id)
+
+        if not pending or time.monotonic() >= deadline:
+            break
+
+        time.sleep(1)
+
+    for prompt_id in pending:
+        state = queue_state(prompt_id)
+
+        if state == "not_found":
+            # It may have finished between the history check and the queue check.
+            history = fetch_history(prompt_id)
+            if history is not None:
+                results[prompt_id] = finished_result(
+                    prompt_id,
+                    history,
+                    output_dir,
+                )
+                continue
+
+        results[prompt_id] = {
+            "prompt_id": prompt_id,
+            "status": state,
+            "images": [],
+        }
+
+    return [results[prompt_id] for prompt_id in dict.fromkeys(prompt_ids)]
+
+
 def generate_one(
     workflow_path,
     prompt,
@@ -248,6 +341,7 @@ def generate_one(
     filename_prefix=None,
     output_dir=PROJECT_DIR / "output",
     quiet=False,
+    wait=True,
 ):
     workflow = load_workflow(workflow_path)
     workflow = copy.deepcopy(workflow)
@@ -324,33 +418,24 @@ def generate_one(
 
     prompt_id = queue_prompt(workflow)
 
+    if not wait:
+        return {
+            "prompt_id": prompt_id,
+            "seed": seed,
+            "status": "queued",
+            "images": [],
+        }
+
     history = wait_for_completion(
         prompt_id,
         quiet=quiet,
     )
 
-    status = history.get("status", {})
-    if status.get("status_str") == "error":
-        raise RuntimeError(
-            json.dumps(status.get("messages", status), ensure_ascii=False)
-        )
-
-    images = extract_images(history)
-
-    downloaded = []
-
-    for image in images:
-        path = download_image(
-            image,
-            output_dir,
-        )
-
-        downloaded.append(str(path))
-
     return {
         "prompt_id": prompt_id,
         "seed": seed,
-        "images": downloaded,
+        "status": "completed",
+        "images": history_images(history, output_dir),
     }
 
 
@@ -370,6 +455,7 @@ def generate(
     count=1,
     output_dir=PROJECT_DIR / "output",
     quiet=False,
+    wait=True,
 ):
     reference_image = None
     reference_size = None
@@ -419,16 +505,20 @@ def generate(
                 filename_prefix=filename_prefix,
                 output_dir=output_dir,
                 quiet=quiet,
+                wait=wait,
             )
 
             results.append({
                 "success": True,
                 "seed": str(current_seed),
                 "prompt_id": result["prompt_id"],
+                "status": result["status"],
                 "images": result["images"],
             })
 
             if not quiet:
+                if result["status"] == "queued":
+                    print(f"Na fila: {result['prompt_id']}")
                 for image in result["images"]:
                     print(f"✓ {image}")
 
@@ -457,7 +547,7 @@ def main():
 
     parser.add_argument(
         "--prompt",
-        required=True,
+        help="Required unless --result is used.",
     )
 
     parser.add_argument(
@@ -536,6 +626,26 @@ def main():
         help="Retorna resultado em JSON",
     )
 
+    parser.add_argument(
+        "--no-wait",
+        action="store_true",
+        help="Queue the job(s) and return prompt ids without waiting.",
+    )
+
+    parser.add_argument(
+        "--result",
+        nargs="+",
+        metavar="PROMPT_ID",
+        help="Fetch results for previously queued prompt ids.",
+    )
+
+    parser.add_argument(
+        "--wait-seconds",
+        type=float,
+        default=50,
+        help="Max seconds --result waits before reporting pending jobs.",
+    )
+
     args = parser.parse_args()
 
     if args.count < 1:
@@ -543,35 +653,67 @@ def main():
         sys.exit(1)
 
     try:
-        # Validate dimensions early so JSON mode still returns an error object
-        normalize_dimensions(args.width, args.height)
+        if args.result:
+            results = collect_results(
+                args.result,
+                max(0, args.wait_seconds),
+                Path(args.output),
+            )
 
-        results = generate(
-            workflow_path=args.workflow,
-            prompt=args.prompt,
-            negative_prompt=args.negative,
-            seed=args.seed,
-            steps=args.steps,
-            cfg=args.cfg,
-            aspect_ratio=args.aspect_ratio,
-            megapixels=args.megapixels,
-            width=args.width,
-            height=args.height,
-            image_path=args.image,
-            filename_prefix=args.filename,
-            count=args.count,
-            output_dir=Path(args.output),
-            quiet=args.json,
-        )
+            finished = ("completed", "error", "not_found")
+            response = {
+                "success": not any(
+                    result["status"] in ("error", "not_found")
+                    for result in results
+                ),
+                "done": all(
+                    result["status"] in finished
+                    for result in results
+                ),
+                "results": results,
+            }
 
-        response = {
-            "success": all(
-                result["success"]
-                for result in results
-            ),
-            "count": len(results),
-            "results": results,
-        }
+            if not args.json:
+                for result in results:
+                    print(f"{result['prompt_id']}: {result['status']}")
+                    for image in result.get("images", []):
+                        print(f"  ✓ {image}")
+                    if "error" in result:
+                        print(f"  ✗ {result['error']}")
+        else:
+            if not args.prompt:
+                raise ValueError("--prompt is required unless --result is used")
+
+            # Validate dimensions early so JSON mode still returns an error object
+            normalize_dimensions(args.width, args.height)
+
+            results = generate(
+                workflow_path=args.workflow,
+                prompt=args.prompt,
+                negative_prompt=args.negative,
+                seed=args.seed,
+                steps=args.steps,
+                cfg=args.cfg,
+                aspect_ratio=args.aspect_ratio,
+                megapixels=args.megapixels,
+                width=args.width,
+                height=args.height,
+                image_path=args.image,
+                filename_prefix=args.filename,
+                count=args.count,
+                output_dir=Path(args.output),
+                quiet=args.json,
+                wait=not args.no_wait,
+            )
+
+            response = {
+                "success": all(
+                    result["success"]
+                    for result in results
+                ),
+                "count": len(results),
+                "results": results,
+            }
 
         if args.json:
             print(json.dumps(

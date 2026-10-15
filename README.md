@@ -6,6 +6,7 @@ Local MCP server and CLI that drive [ComfyUI](https://github.com/comfyanonymous/
 
 - **`generate_image`** — text-to-image with aspect ratio, megapixels, or exact `width`/`height` (64–2048)
 - **`edit_image`** — edit an existing PNG/JPEG with an instruction (e.g. “remove Chinese text, keep the rest”)
+- **`get_result`** — wait for queued jobs and return image paths, so slow machines never hit the MCP client timeout
 - Seed reuse as a decimal string for reproducible runs
 - Same capabilities available from the Python CLI (`comfy_cli.py`)
 
@@ -48,6 +49,8 @@ On Windows the CLI is invoked with `py`. Ensure the Python launcher is on your `
 
 ## MCP tools
 
+Generation is asynchronous. `generate_image` and `edit_image` queue the job in ComfyUI and return right away with `prompt_ids` and seeds. The agent then calls `get_result`, which waits up to 50 seconds per call and is called again until every job is done. This keeps each call under the MCP client request timeout (60 seconds by default), however long your GPU takes.
+
 ### `generate_image`
 
 | Parameter | Description |
@@ -73,6 +76,15 @@ Size tips: icons ~256–512, UI ~1024, cinematic up to 2048.
 
 Editing uses the source as a Qwen reference. Reusing a generation seed alone does **not** edit a picture — use `edit_image`.
 
+### `get_result`
+
+| Parameter | Description |
+|-----------|-------------|
+| `prompt_ids` | Ids returned by `generate_image` or `edit_image` |
+| `wait_seconds` | Max wait per call, 0–50 (default 45) |
+
+Each result reports `completed` (with image paths), `running`, `queued`, `error`, or `not_found`. When `done` is `false`, call it again with the same ids.
+
 ## CLI
 
 ```bash
@@ -87,7 +99,13 @@ py comfy_cli.py --image ./output/photo.png --prompt "Remove all overlaid text" -
 
 # Machine-readable output
 py comfy_cli.py --prompt "..." --json
+
+# Queue without waiting, then fetch later
+py comfy_cli.py --prompt "..." --no-wait --json
+py comfy_cli.py --result <prompt_id> --wait-seconds 50 --json
 ```
+
+Without `--no-wait`, the CLI waits for the image with no time limit.
 
 Images are written to `output/` by default (gitignored).
 
